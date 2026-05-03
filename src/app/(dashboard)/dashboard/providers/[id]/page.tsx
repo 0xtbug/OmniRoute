@@ -6171,7 +6171,6 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
     if (duplicates > 0) {
       notify.warning(t("bulkPasteDuplicatesIgnored", { count: duplicates }));
     }
-    return added.length;
   };
 
   const handleSubmit = async () => {
@@ -6678,11 +6677,7 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
                 }}
                 onPaste={(e) => {
                   const text = e.clipboardData.getData("text");
-                  const lines = text
-                    .split(/\r?\n/)
-                    .map((l) => l.trim())
-                    .filter(Boolean);
-                  if (lines.length < 2) return; // single key — let default paste proceed
+                  if (!/\r?\n/.test(text)) return;
                   e.preventDefault();
                   handleAddParsedExtraKeys(text);
                 }}
