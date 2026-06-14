@@ -355,6 +355,26 @@ export const bulkCreateProviderSchema = z
     }
   });
 
+// ──── Bulk Web-Session Import Schema ────
+
+export const bulkWebSessionImportSchema = z.object({
+  provider: z.string().min(1).max(100),
+  entries: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(200),
+        credential: z
+          .string()
+          .min(1)
+          .max(64 * 1024, "Credential must be under 64 KB"),
+      })
+    )
+    .min(1, "entries must contain at least 1 item")
+    .max(50, "entries must contain at most 50 items"),
+  priority: z.number().int().min(1).max(100).optional(),
+  globalPriority: z.number().int().min(1).max(100).nullable().optional(),
+});
+
 // ──── Codex Import Schema ────
 
 export const importCodexAuthSchema = z.object({
@@ -626,6 +646,7 @@ const comboRuntimeConfigSchema = z
     maxMessagesForSummary: z.coerce.number().int().min(5).max(100).optional(),
     maxComboDepth: z.coerce.number().int().min(1).max(10).optional(),
     trackMetrics: z.boolean().optional(),
+    reasoningTokenBufferEnabled: z.boolean().optional(),
     compressionMode: compressionModeSchema.optional(),
     failoverBeforeRetry: z.boolean().optional(),
     maxSetRetries: z.coerce.number().int().min(0).max(10).optional(),
@@ -731,9 +752,11 @@ export const updateSettingsSchema = z.object({
   hideEndpointCloudflaredTunnel: z.boolean().optional(),
   hideEndpointTailscaleFunnel: z.boolean().optional(),
   hideEndpointNgrokTunnel: z.boolean().optional(),
+  preferClaudeCodeForUnprefixedClaudeModels: z.boolean().optional(),
   pinProviderQuotaToHome: z.boolean().optional(),
   showQuickStartOnHome: z.boolean().optional(),
   showProviderTopologyOnHome: z.boolean().optional(),
+  showTokenSaverOnEndpoint: z.boolean().optional(),
   bruteForceProtection: z.boolean().optional(),
   hiddenSidebarItems: z.array(z.enum(HIDEABLE_SIDEBAR_ITEM_IDS)).optional(),
   comboConfigMode: z.enum(COMBO_CONFIG_MODES).optional(),
@@ -892,38 +915,26 @@ export const v1CountTokensSchema = z
   })
   .catchall(z.unknown());
 
-export const setBudgetSchema = z
-  .object({
-    apiKeyId: z.string().trim().min(1, "apiKeyId is required"),
-    dailyLimitUsd: z.coerce.number().positive("dailyLimitUsd must be greater than zero").optional(),
-    weeklyLimitUsd: z.coerce
-      .number()
-      .positive("weeklyLimitUsd must be greater than zero")
-      .optional(),
-    monthlyLimitUsd: z.coerce
-      .number()
-      .positive("monthlyLimitUsd must be greater than zero")
-      .optional(),
-    warningThreshold: z.coerce.number().min(0).max(1).optional(),
-    resetInterval: z.enum(["daily", "weekly", "monthly"]).optional(),
-    resetTime: z
-      .string()
-      .trim()
-      .regex(/^\d{2}:\d{2}$/, "resetTime must be in HH:MM format")
-      .optional(),
-  })
-  .superRefine((value, ctx) => {
-    const hasAnyLimit = [value.dailyLimitUsd, value.weeklyLimitUsd, value.monthlyLimitUsd].some(
-      (entry) => typeof entry === "number" && Number.isFinite(entry) && entry > 0
-    );
-    if (!hasAnyLimit) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "At least one budget limit must be provided",
-        path: ["dailyLimitUsd"],
-      });
-    }
-  });
+export const setBudgetSchema = z.object({
+  apiKeyId: z.string().trim().min(1, "apiKeyId is required"),
+  // #3537: a limit of 0 means "no limit for this period" (checkBudget only enforces when
+  // activeLimitUsd > 0). The dashboard sends 0 for unfilled fields, so 0 must be accepted —
+  // `.positive()` (rejects 0) used to 400 any save that left a field blank. Negatives are
+  // still rejected by `.min(0)`.
+  dailyLimitUsd: z.coerce.number().min(0, "dailyLimitUsd must be zero or greater").optional(),
+  weeklyLimitUsd: z.coerce.number().min(0, "weeklyLimitUsd must be zero or greater").optional(),
+  monthlyLimitUsd: z.coerce.number().min(0, "monthlyLimitUsd must be zero or greater").optional(),
+  warningThreshold: z.coerce.number().min(0).max(1).optional(),
+  resetInterval: z.enum(["daily", "weekly", "monthly"]).optional(),
+  resetTime: z
+    .string()
+    .trim()
+    .regex(/^\d{2}:\d{2}$/, "resetTime must be in HH:MM format")
+    .optional(),
+});
+// #3537: the previous superRefine required at least one limit > 0, which made it impossible to
+// clear all limits (save 0/0/0). Setting all limits to 0 is a valid "disable enforcement"
+// operation, so no cross-field minimum is imposed.
 
 export const setTokenLimitSchema = z
   .object({
@@ -1126,16 +1137,39 @@ const connectionCooldownProfileSchema = z
 
 const providerBreakerProfileSchema = z
   .object({
-    failureThreshold: z.number().int().min(1).optional(),
+    failureThreshold: z.number().int().min(1).max(1000).optional(),
+    degradationThreshold: z.number().int().min(1).max(1000).optional(),
     resetTimeoutMs: z.number().int().min(1000).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if (
+      typeof value.failureThreshold === "number" &&
+      value.failureThreshold > 1 &&
+      typeof value.degradationThreshold === "number" &&
+      value.degradationThreshold >= value.failureThreshold
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "degradationThreshold must be lower than failureThreshold",
+        path: ["degradationThreshold"],
+      });
+    }
+  });
 
 const waitForCooldownSettingsSchema = z
   .object({
     enabled: z.boolean().optional(),
     maxRetries: z.number().int().min(0).max(10).optional(),
     maxRetryWaitSec: z.number().int().min(0).max(300).optional(),
+  })
+  .strict();
+
+const providerCooldownSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    minRetryCooldownMs: z.number().int().min(0).max(300000).optional(),
+    maxRetryCooldownMs: z.number().int().min(0).max(3600000).optional(),
   })
   .strict();
 
@@ -1157,6 +1191,7 @@ export const updateResilienceSchema = z
       .strict()
       .optional(),
     waitForCooldown: waitForCooldownSettingsSchema.optional(),
+    providerCooldown: providerCooldownSettingsSchema.optional(),
     profiles: z
       .object({
         oauth: legacyResilienceProfileSchema.optional(),
@@ -1173,6 +1208,7 @@ export const updateResilienceSchema = z
       !value.connectionCooldown &&
       !value.providerBreaker &&
       !value.waitForCooldown &&
+      !value.providerCooldown &&
       !value.profiles &&
       !value.defaults
     ) {
@@ -1195,6 +1231,12 @@ const pricingSyncSourceSchema = z.enum(["litellm"]);
 export const pricingSyncRequestSchema = z
   .object({
     sources: z.array(pricingSyncSourceSchema).min(1).optional(),
+    dryRun: z.boolean().optional(),
+  })
+  .strict();
+
+export const intelligenceSyncRequestSchema = z
+  .object({
     dryRun: z.boolean().optional(),
   })
   .strict();
@@ -1534,6 +1576,9 @@ const proxyRegistryFieldsSchema = z
     notes: z.string().trim().max(1000).nullable().optional(),
     status: z.enum(["active", "inactive"]).optional().default("active"),
     source: z.enum(["manual", "oneproxy", "dashboard-custom", "vercel-relay"]).optional(),
+    // Address-family egress policy (#3777): "auto" keeps the prior dual-stack behavior;
+    // "ipv4"/"ipv6" pin the connection to that family (no v4 leak under an IPv6-only proxy).
+    family: z.enum(["auto", "ipv4", "ipv6"]).optional().default("auto"),
   })
   .strict();
 
@@ -1868,6 +1913,7 @@ export const updateKeyPermissionsSchema = z
   .object({
     name: z.string().trim().min(1).max(200).optional(),
     allowedModels: z.array(z.string().trim().min(1)).max(1000).optional(),
+    blockedModels: z.array(z.string().trim().min(1)).max(1000).optional(),
     allowedCombos: z.array(z.string().trim().min(1).max(200)).max(500).optional(),
     allowedConnections: z.array(z.string().uuid()).max(100).optional(),
     noLog: z.boolean().optional(),
@@ -1897,6 +1943,7 @@ export const updateKeyPermissionsSchema = z
     if (
       value.name === undefined &&
       value.allowedModels === undefined &&
+      value.blockedModels === undefined &&
       value.allowedCombos === undefined &&
       value.allowedConnections === undefined &&
       value.noLog === undefined &&
@@ -2256,7 +2303,10 @@ export const codexProfileIdSchema = z.object({
 export const guideSettingsSaveSchema = z
   .object({
     baseUrl: z.string().trim().min(1).optional(),
-    apiKey: z.string().optional(),
+    // #3552: the CLI tool cards post `apiKey: null` in cloud mode (the real key is resolved
+    // server-side from keyId), and `z.string().optional()` rejected null → 400. Normalize
+    // null → undefined so validation passes and the keyId/default path is used.
+    apiKey: z.preprocess((v) => (v === null ? undefined : v), z.string().optional()),
     model: z.string().trim().min(1, "Model is required").optional(),
     models: z.array(z.string().trim().min(1, "Models must be non-empty")).min(1).optional(),
     modelLabels: z.record(z.string(), z.string().trim().min(1)).optional(),
